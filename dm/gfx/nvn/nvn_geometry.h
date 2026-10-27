@@ -70,9 +70,11 @@ static size_t nvn_geo_assemble(int prim, const uint32_t *src, size_t count, int 
 // One ordered compaction per draw. Output is a point/line/triangle list, so it
 // does not depend on Metal primitive-restart behaviour. Preserve triangle-strip
 // winding and the last vertex. Unwritten GS index slots are UINT_MAX.
-// Three dispatches, in order: geo_pack_count (a thread per invocation group counts the indices it
-// emits), geo_pack_scan (one workgroup scans contiguous chunks into ordered offsets and writes the indirect arguments)
-// and geo_pack_write (a thread per group writes its indices at its offset). A single thread used to
+// Large draws use three dispatches: geo_pack_count scans 64-group blocks,
+// geo_pack_scan scans their totals in parallel and writes indirect arguments,
+// then geo_pack_write adds local and block offsets. A draw of up to 1024 groups
+// instead runs geo_pack_small, doing the ordered compaction in one workgroup.
+// A single thread used to
 // walk every group: with it, each frame that drew OCTOPATH TRAVELER II's 129,032-triangle cube shadow mesh
 // (drawn in runs, nvn_geometry.inc geo_split) took about 300 ms; now only the first one is long.
 static const char k_nvn_geo_pack_msl[] =
@@ -90,16 +92,40 @@ static const char k_nvn_geo_pack_msl[] =
 " }\n"
 " return k;\n"
 "}\n"
-"kernel void geo_pack_count(constant geo_pack& j [[buffer(0)]], uint g [[thread_position_in_grid]]) { if(g<j.groups) j.cnt[g]=geo_group(j,g,false,0); }\n"
-"kernel void geo_pack_scan(constant geo_pack& j [[buffer(0)]],uint t[[thread_index_in_threadgroup]],uint3 tg[[threads_per_threadgroup]]) {\n"
-" threadgroup ulong sums[256]; uint nt=tg.x, chunk=j.groups/nt+uint(j.groups%nt!=0);\n"
-" uint begin=uint(min(ulong(t)*chunk,ulong(j.groups))),end=begin+min(chunk,j.groups-begin);\n"
-" ulong s=0;for(uint g=begin;g<end;g++)s+=j.cnt[g];sums[t]=s;threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-" for(uint d=1;d<nt;d<<=1){ulong a=t>=d?sums[t-d]:0;threadgroup_barrier(mem_flags::mem_threadgroup);sums[t]+=a;threadgroup_barrier(mem_flags::mem_threadgroup);}\n"
-" s=t?sums[t-1]:0;for(uint g=begin;g<end;g++){uint c=j.cnt[g];j.cnt[g]=uint(min(s,ulong(0xffffffffu)));s+=c;}\n"
-" if(t==0){ulong total=sums[nt-1];uint w=j.topology==1?1u:j.topology==6?2u:3u,n=total<=j.capacity?uint(total):j.capacity-j.capacity%w;\n"
+"kernel void geo_pack_count(constant geo_pack& j [[buffer(0)]], uint g [[thread_position_in_grid]], uint block [[threadgroup_position_in_grid]],\n"
+" uint li [[thread_index_in_threadgroup]], uint si [[simdgroup_index_in_threadgroup]], uint sl [[thread_index_in_simdgroup]], uint sw [[threads_per_simdgroup]]) {\n"
+" threadgroup uint sums[64]; uint c=g<j.groups?geo_group(j,g,false,0):0u;\n"
+" uint local=simd_prefix_exclusive_sum(c), total=simd_sum(c); if(sl==0) sums[si]=total;\n"
+" threadgroup_barrier(mem_flags::mem_threadgroup); uint before=0; for(uint s=0;s<si;s++) before+=sums[s];\n"
+" if(g<j.groups) j.cnt[g]=before+local;\n"
+" if(li==0) { uint n=0; for(uint s=0;s<(64u+sw-1u)/sw;s++) n+=sums[s]; j.cnt[j.groups+block]=n; }\n"
+"}\n"
+// Block totals use wide arithmetic so malformed totals cannot wrap into writable output.
+"kernel void geo_pack_scan_legacy(constant geo_pack& j [[buffer(0)]]) {\n"
+" uint blocks=j.groups/64u+uint(j.groups%64u!=0u);ulong s=0;\n"
+" for(uint b=0;b<blocks;b++){uint c=j.cnt[j.groups+b];j.cnt[j.groups+b]=uint(min(s,ulong(0xffffffffu)));s+=c;}\n"
+" uint w=j.topology==1?1u:j.topology==6?2u:3u,n=s<=j.capacity?uint(s):j.capacity-j.capacity%w;\n"
+" j.args[0]=n;j.args[1]=1;j.args[2]=0;j.args[3]=0;j.args[4]=0;\n"
+"}\n"
+"kernel void geo_pack_scan(constant geo_pack& j [[buffer(0)]], uint li [[thread_index_in_threadgroup]], uint3 nt [[threads_per_threadgroup]]) {\n"
+" threadgroup ulong sums[256];uint blocks=j.groups/64u+uint(j.groups%64u!=0u),chunk=(blocks+nt.x-1u)/nt.x,lo=li*chunk,hi=min(lo+chunk,blocks);ulong s=0;\n"
+" for(uint b=lo;b<hi;b++)s+=j.cnt[j.groups+b];sums[li]=s;threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+" for(uint step=1;step<nt.x;step<<=1){ulong add=li>=step?sums[li-step]:0;threadgroup_barrier(mem_flags::mem_threadgroup);sums[li]+=add;threadgroup_barrier(mem_flags::mem_threadgroup);}\n"
+" s=li?sums[li-1]:0;for(uint b=lo;b<hi;b++){uint c=j.cnt[j.groups+b];j.cnt[j.groups+b]=uint(min(s,ulong(0xffffffffu)));s+=c;}\n"
+" if(li==0){ulong total=sums[nt.x-1];uint w=j.topology==1?1u:j.topology==6?2u:3u,n=total<=j.capacity?uint(total):j.capacity-j.capacity%w;\n"
 " j.args[0]=n;j.args[1]=1;j.args[2]=0;j.args[3]=0;j.args[4]=0;}\n"
 "}\n"
-"kernel void geo_pack_write(constant geo_pack& j [[buffer(0)]], uint g [[thread_position_in_grid]]) { if(g<j.groups) geo_group(j,g,true,j.cnt[g]); }\n";
-// The job record geo_pack reads (host side): the counts / offsets buffer holds a word per group
+// One workgroup can compact a small draw without global intermediate counts
+// or two extra dispatches. Chunks are contiguous, preserving invocation order.
+"kernel void geo_pack_small(constant geo_pack& j [[buffer(0)]], uint li [[thread_index_in_threadgroup]],\n"
+" uint si [[simdgroup_index_in_threadgroup]], uint sl [[thread_index_in_simdgroup]], uint sw [[threads_per_simdgroup]], uint3 nt [[threads_per_threadgroup]]) {\n"
+" threadgroup uint sums[128];uint chunk=(j.groups+nt.x-1u)/nt.x,lo=li*chunk,hi=min(lo+chunk,j.groups),s=0;\n"
+" for(uint g=lo;g<hi;g++)s+=geo_group(j,g,false,0);uint before=simd_prefix_exclusive_sum(s),total=simd_sum(s);if(sl==0)sums[si]=total;\n"
+" threadgroup_barrier(mem_flags::mem_threadgroup);for(uint b=0;b<si;b++)before+=sums[b];\n"
+" for(uint g=lo;g<hi;g++)before+=geo_group(j,g,true,before);\n"
+" if(li==0){uint n=0;for(uint b=0;b<(nt.x+sw-1u)/sw;b++)n+=sums[b];uint w=j.topology==1?1u:j.topology==6?2u:3u;n=n<=j.capacity?n:j.capacity-j.capacity%w;\n"
+" j.args[0]=n;j.args[1]=1;j.args[2]=0;j.args[3]=0;j.args[4]=0;}\n"
+"}\n"
+"kernel void geo_pack_write(constant geo_pack& j [[buffer(0)]], uint g [[thread_position_in_grid]]) { if(g<j.groups){ulong o=ulong(j.cnt[g])+j.cnt[j.groups+g/64u];if(o<=0xffffffffu)geo_group(j,g,true,uint(o));} }\n";
+// One word per group for local offsets, followed by one per 64-group block for block offsets.
 typedef struct { uint64_t src, dst, args; uint32_t groups, stride, topology, capacity; uint64_t cnt; } nvn_geo_pack_job;

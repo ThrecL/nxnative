@@ -474,8 +474,12 @@ uint32_t svc_thread_main_init(void) {
     pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; pthread_mutex_unlock(&G);
     pthread_setspecific(g_keythr, t);
     pthread_setname_np("0x1001 main thread");
+    // The iOS boot pthread inherits default QoS. Apply the same guest policy
+    // as worker threads before the main thread starts recording/rendering.
+    qos_apply(t);
     qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0;
     pthread_get_qos_class_np(pthread_self(), &qc, &rp); t->qos = (uint32_t)qc;
+    LOG("main guest thread QoS %#x (priority %d)", t->qos, t->prio);
     return t->handle;
 }
 

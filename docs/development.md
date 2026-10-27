@@ -304,6 +304,8 @@ PR #368 reports Animal Crossing's app shrinking from 11 GB to 1.2 GB, with reins
 
 The unsigned IPA build still uses the repository's `dm/ios/DmIOS.xcodeproj`, skips the resource phase (`DM_COPY_GAME_RESOURCES=NO`) and packs the resources straight from the drive as before.
 
+The iPhone settings list can require a verified rewrite capability (`fixups:<NAME>` in `dm/games/settings.tsv`). A game's `patches.py` declares `CAPABILITIES = {build ID: (name, ...)}`; the rewriter writes those flags only for that main build. This keeps controls that require particular rewritten instructions out of older or unsupported builds. For example, NieR's resolution control requires its native scale/UV path and configurable preset bounds.
+
 ## Port another game
 
 Each game has a profile in `dm/games/<id>/`:
@@ -356,6 +358,8 @@ Notes on these steps:
 - It also bundles a standard font (macOS's Arial Unicode, `STD_FONT=` overrides it) and the generated `nintendo_ext.ttf`.
 - The icon is the `icon.jpg` that `nx_extract` saves next to `RomFS.img`; `DM_ICON=` points at another image.
 - `DM_ENV_FILE=` bakes environment switches into the app, and `DM_DISPLAY_NAME=` renames it.
+- The optional compiler definition `DM_PLAYER_BUILD=1` makes the iOS app ignore saved NVN diagnostic/renderer overrides, test switches, Metal validation switches and scripted input/capture controls from environment files. It also ignores a saved shader-library path so the app uses the new bundle's libraries. FPS and Metal HUD switches, frame rate, console mode, language and controller settings remain available. `DM_NVN_ENC_THREAD` is also retained: it selects direct/deferred encoding without enabling profiling, validation or dumps. Normal builds keep the existing environment-file behavior. This allows a player IPA to update a previously profiled installation without deleting its saved environment file or saves.
+- In that player build, settings declared in `dm/launcher.json` are controlled by the launcher and its saved choices; environment files cannot lock those rows. The raw `MTL_HUD_ENABLED` override is ignored when the launcher offers the Metal HUD control. `DM_METAL_HUD` supplied to the build sets its initial launcher default, while the control stays editable.
 - `DM_LANG=<code>` is the game language (`DMLanguage` in `Info.plist`, default `en-US`; `main.m` sets `DM_LANG` from it unless `Documents/env.txt` or the baked env file sets it).
 - `DM_METAL_CAPTURE=1` makes a build that can write GPU frame captures (`MetalCaptureEnabled` in `Info.plist`, for `DM_GPU_CAPTURE`, [GPU measurement](#gpu-measurement)).
 - `DM_SHOW_FPS=1` turns the frame-rate counter on (`DMShowFPS` in `Info.plist`, which `front_ios.m` reads; `DM_SHOW_FPS` in `Documents/env.txt` overrides it). It counts the frames put on screen each second (`mtl_present_count`), so frames the display link merges away are not counted.

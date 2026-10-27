@@ -128,11 +128,20 @@ def capture(src):
     pro += (f'    uint4 dm_ci = dm_gs.info; device uint* dm_capture = dm_gs.dst;\n'
             f'    if (dm_vid - dm_ci.x >= dm_ci.y || dm_iid - dm_ci.z >= dm_ci.w) return;\n'
             f'    device uint* dm_p = dm_capture + ((ulong(dm_iid - dm_ci.z) * dm_ci.y + dm_vid - dm_ci.x) * {WORDS});\n')
-    # Initialize missing attributes exactly as the normal vertex builder does.
-    epilogue = ('{ for (uint dm_k = 0; dm_k < 144; ++dm_k) dm_p[dm_k] = 0; '
-                'dm_p[3] = dm_p[4] = 0x3f800000u; '
-                'for (uint dm_k = 19; dm_k < 144; dm_k += 4) dm_p[dm_k] = 0x3f800000u; '
-                + ' '.join(stores) + ' return; }')
+    # Store each record word once: do not clear outputs that the captured
+    # vertex immediately overwrites. Missing attributes retain the ordinary
+    # vertex defaults, including homogeneous W and point size. Vectorize whole
+    # missing slots; every record starts at a 16-byte-aligned 144-word stride.
+    written = {int(x) for x in re.findall(r'dm_p\[(\d+)\]', ' '.join(stores))}
+    def default(i):
+        return '0x3f800000u' if i in (3, 4) or i >= 19 and i % 4 == 3 else '0u'
+    initializers = []
+    for i in range(0, WORDS, 4):
+        if all(k not in written for k in range(i, i + 4)):
+            initializers.append(f'*((device uint4*)(dm_p + {i})) = uint4(' + ', '.join(default(k) for k in range(i, i + 4)) + ');')
+        else:
+            initializers += [f'dm_p[{k}] = {default(k)};' for k in range(i, i + 4) if k not in written]
+    epilogue = '{ ' + ' '.join(initializers + stores) + ' return; }'
     if 'return out;' not in body:
         raise ValueError('geometry capture: missing return')
     return '\nstruct dm_geometry_capture { device uint* dst; uint4 info; };\nvertex void main0_gs(' + params + ')\n{\n' + pro + body.replace('return out;', epilogue)

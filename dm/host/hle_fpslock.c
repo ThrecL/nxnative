@@ -63,18 +63,99 @@ static const struct { const char *build, *what; uint64_t ptr_off; uint32_t field
 
 static int rd(uint64_t a, void *out, size_t n) { vm_size_t got = 0; return a >= 0x1000 && vm_read_overwrite(mach_task_self(), (vm_address_t)a, n, (vm_address_t)out, &got) == KERN_SUCCESS && got == n; }
 
+// The verified native controller clamps the current scale and publishes the
+// matching viewport/UV ratios. Never lower its floor in an old rewrite whose
+// 1080p code cuts bypass those operations. No executable memory is modified.
+static void dynamic_resolution_tick(void) {
+    static int state = -1, dynamic; static uint8_t *base;
+    if (state < 0) {
+        state = 0;
+        for (int i=0;i<g_nmod;i++) if (!strcmp(g_mod[i].name,"main") &&
+            !strcmp(g_mod[i].build_id,"3c10ec35c5ef4c3686b4053afb0e58e7")) base=g_mod[i].base;
+        if (!base) return;
+        const char *e=getenv("DM_DYNAMIC_RESOLUTION");
+        if (e && strcmp(e,"0") && strcmp(e,"1")) LOG("[RED] DM_DYNAMIC_RESOLUTION=%s: must be 0 or 1; keeping full resolution",e);
+        dynamic=e && !strcmp(e,"1");
+        if (dynamic) {
+            uint32_t clamp=0,publish=0;uint64_t floors[2]={0};
+            if (!rd((uint64_t)(base+0x9bf568),&clamp,4) || !rd((uint64_t)(base+0x9bf578),&publish,4) ||
+                !rd((uint64_t)(base+0x9bf528),&floors[0],8) || !rd((uint64_t)(base+0x9bf534),&floors[1],8) ||
+                clamp!=0x1e254c80u || publish!=0x54000489u ||
+                floors[0]!=0x72a7f00c5280000cull || floors[1]!=0x72a7f00c5280000cull) {
+                LOG("[RED] dynamic resolution needs a new rewrite with native scale/UV instructions and preset bounds; keeping full resolution");dynamic=0;
+            }
+        }
+        state=1;
+        LOG("main: NieR dynamic resolution %s (DM_DYNAMIC_RESOLUTION)",dynamic?"on; native controller, 70–100% scale":"off; full resolution");
+    }
+    if (!state) return;
+    uint32_t cur[2];uint64_t a=(uint64_t)(base+0x128e068);
+    if (!rd(a,cur,sizeof cur)) return;
+    // The verified rewrite uses the native preset's lower bound in both modes.
+    // With DRS on, the game owns current scale, UV ratios and all counters.
+    uint32_t minimum=dynamic?0x3f333333u:0x3f800000u;
+    if (cur[0]!=minimum) { uint32_t *p=(uint32_t *)(uintptr_t)a;dm_guest_write_prepare(p,4);__atomic_store_n(p,minimum,__ATOMIC_RELAXED); }
+    if (!dynamic && cur[1]!=0x3f800000u) { uint32_t *p=(uint32_t *)(uintptr_t)(a+4);dm_guest_write_prepare(p,4);__atomic_store_n(p,0x3f800000u,__ATOMIC_RELAXED); }
+}
+
 void dm_fps_lock_tick(void) {
-    static int state = -2, rows[NLOCKS], nrow, nlog[NLOCKS], target; static uint8_t *base; static const char *src;
+    dynamic_resolution_tick();   // independent of the frame-rate cap, including target 0 / 30
+    static int state = -2, rows[NLOCKS], nrow, nlog[NLOCKS], target, nier; static uint8_t *base; static const char *src;
     if (state == -1) return;
     if (state == -2) {
         state = -1;
-        for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main"))
+        for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) {
+            if (!strcmp(g_mod[i].build_id, "992787e2b54259948b844059a8ab21ad")) { base = g_mod[i].base; nier = 1; }
+            if (!strcmp(g_mod[i].build_id, "3c10ec35c5ef4c3686b4053afb0e58e7")) { base = g_mod[i].base; nier = 2; }
             for (int k = 0; k < NLOCKS; k++) if (!strcmp(g_mod[i].build_id, k_locks[k].build)) { rows[nrow++] = k; base = g_mod[i].base; }
-        if (!nrow) return;
+        }
+        if (!nrow && !nier) return;
         const char *e = getenv("DM_FPS_TARGET"); int t = e ? atoi(e) : DM_GAME_FPS_TARGET; src = e ? "DM_FPS_TARGET" : "game profile fps_target";
         if (t != 0 && t != 30 && t != 60) { LOG("[RED] DM_FPS_TARGET=%s: must be 0, 30 or 60; leaving the game's frame limit", e); t = 0; }
-        if (!t) { for (int r = 0; r < nrow; r++) LOG("main: %s left as the game sets it (%s)", k_locks[rows[r]].what, src); return; }
+        if (!t) { for (int r = 0; r < nrow; r++) LOG("main: %s left as the game sets it (%s)", k_locks[rows[r]].what, src); if (nier) LOG("main: NieR frame interval left as the game sets it (%s)", src); return; }
         target = t; state = 0;
+    }
+    if (nier == 1) {
+        // NieR:Automata (Switch) 1.0.2, matching the 60 FPS Atmosphere cheat
+        // for build 992787E2B5425994. Its chain follows the frame interval field;
+        // value 2 is the game's 30 FPS default and 1 selects 60 FPS.
+        uint64_t p = 0, q = 0; static int nlog_nier;
+        if (rd((uint64_t)(uintptr_t)(base + 0x192c818), &p, sizeof p) && p) {
+            const uint64_t offsets[] = {0x40, 0x10, 0x60, 0x180};
+            int ok = 1;
+            for (size_t i = 0; i < sizeof offsets / sizeof offsets[0]; i++) {
+                if (!rd(p + offsets[i], &q, sizeof q) || !q) { ok = 0; break; }
+                p = q;
+            }
+            if (ok) {
+                uint64_t a = p + 0xf14; uint32_t cur = 0, want = (uint32_t)(60 / target);
+                if (rd(a, &cur, sizeof cur) && cur != want && (cur == 1 || cur == 2)) {
+                    uint32_t *dst = (uint32_t *)(uintptr_t)a;
+                    dm_guest_write_prepare(dst, sizeof *dst); __atomic_store_n(dst, want, __ATOMIC_RELAXED);
+                    if (nlog_nier++ < 8) LOG("main: NieR frame interval %u → %u (%d fps; %s)", cur, want, target, src);
+                }
+            }
+        }
+    } else if (nier == 2) {
+        // NieR:Automata US/EU 1.0.3 (3c10ec35c5ef4c3686b4053afb0e58e7):
+        // - [base + 0x192be00] points to the NVN graphics device object whose +0x9c160 holds the present interval (1 = 60 FPS, 2 = 30 FPS),
+        //   and base + 0x192c304 (+0x504) holds the requested interval mode (0 = 60 FPS, 1 = 30 FPS).
+        // Resolution policy is applied independently above, so 30/60 FPS does
+        // not implicitly enable or disable the native resolution controller.
+        uint64_t p = 0; static int nlog_nier;
+        uint32_t want = (uint32_t)(60 / target), want_mode = want - 1, cur_mode = 0;
+        if (rd((uint64_t)(uintptr_t)(base + 0x192c304), &cur_mode, sizeof cur_mode) && cur_mode != want_mode && (cur_mode == 0 || cur_mode == 1)) {
+            uint32_t *dst = (uint32_t *)(uintptr_t)(base + 0x192c304);
+            dm_guest_write_prepare(dst, sizeof *dst); __atomic_store_n(dst, want_mode, __ATOMIC_RELAXED);
+        }
+        if (rd((uint64_t)(uintptr_t)(base + 0x192be00), &p, sizeof p) && p) {
+            uint64_t a = p + 0x9c160; uint32_t cur = 0;
+            if (rd(a, &cur, sizeof cur) && cur != want && (cur == 1 || cur == 2)) {
+                uint32_t *dst = (uint32_t *)(uintptr_t)a;
+                dm_guest_write_prepare(dst, sizeof *dst); __atomic_store_n(dst, want, __ATOMIC_RELAXED);
+                if (nlog_nier++ < 8) LOG("main: NieR frame interval %u → %u (%d fps; %s)", cur, want, target, src);
+            }
+        }
     }
     for (int r = 0; r < nrow; r++) {
         int k = rows[r]; uint64_t obj = (uint64_t)(uintptr_t)base;
